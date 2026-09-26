@@ -1,0 +1,6 @@
+{
+  "name": "online-learning-platform",
+  "private": true,
+  "scripts": { "install:all": "npm install && npm install --prefix server && npm install --prefix client", "dev": "npm run dev --prefix client", "build": "npm run build --prefix client" },
+  "devDependencies": { "concurrently": "^9.1.2" }
+}
