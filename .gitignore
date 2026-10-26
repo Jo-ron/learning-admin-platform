@@ -6,3 +6,4 @@ logs/
 *.log
 .vscode/
 .DS_Store
+server/data/

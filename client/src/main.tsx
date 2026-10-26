@@ -73,11 +73,13 @@ const courseStatusToUi: Record<string, string> = {
   published: "已发布",
   draft: "草稿",
   archived: "已下架",
+  cancelled: "已取消",
 };
 const courseStatusToApi: Record<string, string> = {
   已发布: "published",
   草稿: "draft",
-  已下架: "draft",
+  已下架: "archived",
+  已取消: "cancelled",
 };
 const studentStatusToUi: Record<string, string> = {
   active: "正常",
@@ -271,6 +273,45 @@ api.interceptors.response.use(
     return Promise.reject(error);
   },
 );
+
+// —— 埋点：轻量事件上报（页面访问 / 会话 / 业务），统一发往 /api/tracking/events ——
+const trackSessionId = (() => {
+  let id = sessionStorage.getItem("track_session");
+  if (!id) {
+    id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    sessionStorage.setItem("track_session", id);
+  }
+  return id;
+})();
+const trackQueue: Array<Record<string, unknown>> = [];
+let trackTimer: number | undefined;
+const trackUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem("user") || "null");
+  } catch {
+    return null;
+  }
+};
+const flushTrack = () => {
+  trackTimer = undefined;
+  if (!trackQueue.length) return;
+  const batch = trackQueue.splice(0, trackQueue.length);
+  api.post("/tracking/events", batch).catch(() => {});
+};
+function track(eventName: string, eventType = "click", extra: Record<string, unknown> = {}) {
+  const user = trackUser();
+  trackQueue.push({
+    event_name: eventName,
+    event_type: eventType,
+    user_id: user?.id ?? null,
+    session_id: trackSessionId,
+    page_path: window.location.pathname,
+    payload: extra,
+  });
+  if (trackTimer === undefined) trackTimer = window.setTimeout(flushTrack, 800);
+}
+window.addEventListener("beforeunload", flushTrack);
+
 type Course = {
   id: number;
   name: string;
@@ -295,6 +336,7 @@ const statusColor: Record<string, string> = {
   已发布: "green",
   草稿: "gold",
   已下架: "default",
+  已取消: "red",
   正常: "green",
   休学: "orange",
 };
@@ -317,8 +359,10 @@ function Login() {
       const r = await api.post("/auth/login", v);
       localStorage.setItem("token", r.data.token);
       localStorage.setItem("user", JSON.stringify(r.data.user));
+      track("login_success", "session");
       nav("/");
     } catch (error: any) {
+      track("login_fail", "session", { reason: error.response?.data?.msg || "账号或密码错误" });
       message.error(error.response?.data?.msg || "账号或密码错误");
     } finally {
       setLoading(false);
@@ -380,6 +424,7 @@ function Shell({ children }: { children: React.ReactNode }) {
     localStorage.getItem("user") || '{"name":"系统管理员"}',
   );
   const logout = () => {
+    track("logout", "session");
     localStorage.clear();
     nav("/login");
   };
@@ -523,9 +568,6 @@ function Dashboard() {
                   </span>
                 )}
               />
-              <div className="stat-foot">
-                较上周 <b>+12.5%</b>
-              </div>
             </Card>
           </Col>
         ))}
@@ -668,6 +710,10 @@ function CoursePage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Course>();
   const [form] = Form.useForm();
+  const [cancellingCourse, setCancellingCourse] = useState<Course>();
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelSaving, setCancelSaving] = useState(false);
   const load = () =>
     api.get("/courses", { params: q }).then((r) => setData(r.data));
   useEffect(() => {
@@ -686,14 +732,48 @@ function CoursePage() {
   };
   const save = async (v: any) => {
     try {
-      await (editing
+      const res = await (editing
         ? api.put(`/courses/${editing.id}`, v)
         : api.post("/courses", v));
+      track(editing ? "course_update_success" : "course_create_success", "business", {
+        course_id: res.data?.id ?? editing?.id,
+        status: v.status,
+      });
       message.success("保存成功");
       setOpen(false);
       load();
     } catch (error: any) {
       message.error(error.response?.data?.msg || "保存课程失败");
+    }
+  };
+  const cancelCourse = async () => {
+    if (!cancellingCourse || !cancelReason.trim()) {
+      message.error("请填写课程取消原因");
+      return;
+    }
+    setCancelSaving(true);
+    try {
+      const response = await api.put(`/courses/${cancellingCourse.id}`, {
+        ...cancellingCourse,
+        status: "已取消",
+        cancel_reason: cancelReason.trim(),
+      });
+      message.success(
+        `课程已取消，${response.data.cancelledEnrollmentCount} 条在读记录已标记为课程取消`,
+      );
+      track("course_cancel", "business", {
+        course_id: cancellingCourse.id,
+        cancel_reason: cancelReason.trim(),
+        cancelled_count: response.data.cancelledEnrollmentCount,
+      });
+      setCancelOpen(false);
+      setCancelReason("");
+      setCancellingCourse(undefined);
+      load();
+    } catch (error: any) {
+      message.error(error.response?.data?.msg || "取消课程失败");
+    } finally {
+      setCancelSaving(false);
     }
   };
   return (
@@ -720,7 +800,7 @@ function CoursePage() {
             allowClear
             placeholder="课程状态"
             onChange={(v) => setQ({ ...q, page: 1, status: v || "" })}
-            options={["草稿", "已发布", "已下架"].map((v) => ({
+            options={["草稿", "已发布", "已下架", "已取消"].map((v) => ({
               label: v,
               value: v,
             }))}
@@ -784,11 +864,30 @@ function CoursePage() {
                   <Button
                     type="text"
                     icon={<EditOutlined />}
+                    disabled={r.status === "已取消"}
                     onClick={() => edit(r)}
                   />
+                  {r.status !== "已取消" && (
+                    <Button
+                      type="link"
+                      danger
+                      onClick={() => {
+                        setCancellingCourse(r);
+                        setCancelReason("");
+                        setCancelOpen(true);
+                      }}
+                    >
+                      取消课程
+                    </Button>
+                  )}
                   <Popconfirm
                     title="确认删除这门课程？"
-                    onConfirm={() => api.delete(`/courses/${r.id}`).then(load)}
+                    onConfirm={() =>
+                      api.delete(`/courses/${r.id}`).then(() => {
+                        track("course_delete", "business", { course_id: r.id });
+                        load();
+                      })
+                    }
                   >
                     <Button type="text" danger icon={<DeleteOutlined />} />
                   </Popconfirm>
@@ -856,6 +955,28 @@ function CoursePage() {
           </Form.Item>
         </Form>
       </Modal>
+      <Modal
+        title="取消课程"
+        open={cancelOpen}
+        onCancel={() => setCancelOpen(false)}
+        onOk={cancelCourse}
+        confirmLoading={cancelSaving}
+        okButtonProps={{ danger: true }}
+        okText="确认取消"
+        cancelText="返回"
+      >
+        <p>
+          确认取消「{cancellingCourse?.name}」？该课程的在读选课记录会改为“课程取消”；已结课和已退课记录保留。
+        </p>
+        <Input.TextArea
+          value={cancelReason}
+          onChange={(event) => setCancelReason(event.target.value)}
+          placeholder="请填写取消原因"
+          maxLength={500}
+          showCount
+          rows={3}
+        />
+      </Modal>
     </div>
   );
 }
@@ -894,9 +1015,12 @@ function StudentPage() {
   const save = async (v: any) => {
     setSaving(true);
     try {
-      await (editing
+      const res = await (editing
         ? api.put(`/students/${editing.id}`, v)
         : api.post("/students", v));
+      track(editing ? "student_update_success" : "student_create_success", "business", {
+        student_id: res.data?.id ?? editing?.id,
+      });
       message.success("保存成功");
       setOpen(false);
       form.resetFields();
@@ -994,7 +1118,12 @@ function StudentPage() {
                   />
                   <Popconfirm
                     title="确认删除这位学生？"
-                    onConfirm={() => api.delete(`/students/${r.id}`).then(load)}
+                    onConfirm={() =>
+                      api.delete(`/students/${r.id}`).then(() => {
+                        track("student_delete", "business", { student_id: r.id });
+                        load();
+                      })
+                    }
                   >
                     <Button type="text" danger icon={<DeleteOutlined />} />
                   </Popconfirm>
@@ -1145,8 +1274,8 @@ function TeacherPage() {
   const load = () => api.get('/teachers', { params: q }).then(r => setData({ rows: r.data.list || r.data.rows || [], total: r.data.total || 0 }));
   useEffect(() => { load(); }, [q]);
   const edit = (teacher?: any) => { setEditing(teacher); form.resetFields(); form.setFieldsValue(teacher || { status: 'active' }); setOpen(true); };
-  const save = async (values: any) => { setSaving(true); try { await (editing ? api.put(`/teachers/${editing.id}`, values) : api.post('/teachers', values)); message.success('保存成功'); setOpen(false); load(); } catch (error: any) { message.error(error.response?.data?.msg || '保存教师失败'); } finally { setSaving(false); } };
-  const remove = async (id: number) => { try { await api.delete(`/teachers/${id}`); message.success('删除成功'); load(); } catch (error: any) { message.error(error.response?.data?.msg || '删除失败'); } };
+  const save = async (values: any) => { setSaving(true); try { await (editing ? api.put(`/teachers/${editing.id}`, values) : api.post('/teachers', values)); track(editing ? 'teacher_update_success' : 'teacher_create_success', 'business', { teacher_id: editing?.id }); message.success('保存成功'); setOpen(false); load(); } catch (error: any) { message.error(error.response?.data?.msg || '保存教师失败'); } finally { setSaving(false); } };
+  const remove = async (id: number) => { try { await api.delete(`/teachers/${id}`); track('teacher_delete', 'business', { teacher_id: id }); message.success('删除成功'); load(); } catch (error: any) { message.error(error.response?.data?.msg || '删除失败'); } };
   return <div className="page"><div className="page-title compact"><div><h1>教师管理</h1></div><Button type="primary" icon={<PlusOutlined />} onClick={() => edit()}>新增教师</Button></div><Card className="table-card"><div className="filters"><Input allowClear prefix={<SearchOutlined />} placeholder="搜索姓名、手机号或部门" onChange={e => setQ({ ...q, page: 1, search: e.target.value })} /><Select allowClear placeholder="教师状态" onChange={v => setQ({ ...q, page: 1, status: v || '' })} options={[{ label: '在岗', value: 'active' }, { label: '离职', value: 'inactive' }]} /></div><Table rowKey="id" dataSource={data.rows} pagination={{ current: q.page, pageSize: q.pageSize, total: data.total, showSizeChanger: false, onChange: page => setQ({ ...q, page }) }} columns={[{ title: '教师ID', dataIndex: 'id', width: 90 }, { title: '姓名', dataIndex: 'name' }, { title: '手机号', dataIndex: 'phone' }, { title: '所属部门', dataIndex: 'department' }, { title: '状态', dataIndex: 'status', render: (v: string) => <Tag color={v === 'active' ? 'green' : 'default'}>{v === 'active' ? '在岗' : '离职'}</Tag> }, { title: '简介', dataIndex: 'bio' }, { title: '操作', render: (_: any, record: any) => <Space><Button type="text" icon={<EditOutlined />} onClick={() => edit(record)} /><Popconfirm title="确认删除该教师？" onConfirm={() => remove(record.id)}><Button type="text" danger icon={<DeleteOutlined />} /></Popconfirm></Space> }]} /></Card><Modal title={editing ? '编辑教师' : '新增教师'} open={open} onCancel={() => setOpen(false)} onOk={() => form.submit()} okButtonProps={{ loading: saving }} okText="保存" cancelText="取消"><Form form={form} layout="vertical" onFinish={save}><Row gutter={12}><Col span={12}><Form.Item name="name" label="姓名" rules={[{ required: true, message: '请输入姓名' }]}><Input /></Form.Item></Col><Col span={12}><Form.Item name="phone" label="手机号"><Input /></Form.Item></Col></Row><Row gutter={12}><Col span={12}><Form.Item name="department" label="所属部门"><Input /></Form.Item></Col><Col span={12}><Form.Item name="status" label="状态"><Select options={[{ label: '在岗', value: 'active' }, { label: '离职', value: 'inactive' }]} /></Form.Item></Col></Row><Form.Item name="bio" label="简介"><Input.TextArea rows={3} /></Form.Item></Form></Modal></div>;
 }
 
@@ -1183,10 +1312,15 @@ function EnrollmentPage() {
   const add = async (v: any) => {
     setSaving(true);
     try {
-      await api.post("/enrollments", {
+      const res = await api.post("/enrollments", {
         student_id: v.studentId,
         course_id: v.courseId,
         note: v.note || "",
+      });
+      track("enrollment_create_success", "business", {
+        enrollment_id: res.data?.enrollment_id,
+        student_id: v.studentId,
+        course_id: v.courseId,
       });
       message.success("新增选课成功");
       setOpen(false);
@@ -1201,6 +1335,7 @@ function EnrollmentPage() {
   const changeStatus = async (ids: React.Key[]) => {
     try {
       await api.patch("/enrollments/bulk/status", { ids, status: "dropped" });
+      track(ids.length > 1 ? "enrollment_bulk_drop" : "enrollment_drop", "business", { enrollment_ids: ids, count: ids.length });
       message.success(ids.length > 1 ? "批量退课成功" : "退课成功");
       setSelected([]);
       load();
@@ -1212,6 +1347,7 @@ function EnrollmentPage() {
     studying: "在读",
     completed: "已结课",
     dropped: "退课",
+    cancelled: "课程取消",
   };
   return (
     <div className="page">
@@ -1281,7 +1417,7 @@ function EnrollmentPage() {
             selectedRowKeys: selected,
             onChange: setSelected,
             getCheckboxProps: (record) => ({
-              disabled: record.status === "dropped",
+              disabled: record.status === "dropped" || record.status === "cancelled",
             }),
           }}
           dataSource={data.rows}
@@ -1308,6 +1444,8 @@ function EnrollmentPage() {
                       ? "green"
                       : value === "completed"
                         ? "blue"
+                        : value === "cancelled"
+                          ? "red"
                         : "default"
                   }
                 >
@@ -1315,14 +1453,21 @@ function EnrollmentPage() {
                 </Tag>
               ),
             },
-            { title: "备注", dataIndex: "note" },
+            {
+              title: "备注/处理说明",
+              dataIndex: "note",
+              render: (value: string, record: any) =>
+                record.status === "cancelled"
+                  ? `课程取消：${record.cancel_reason || "未提供原因"}`
+                  : value,
+            },
             {
               title: "操作",
               render: (_: any, record: any) => (
                 <Button
                   type="link"
                   danger
-                  disabled={record.status === "dropped"}
+                  disabled={record.status === "dropped" || record.status === "cancelled"}
                   onClick={() => changeStatus([record.enrollment_id])}
                 >
                   退课
@@ -1486,15 +1631,28 @@ function AnnouncementsPage() {
   const load = () => api.get('/announcements', { params: q }).then(r => setData(r.data)).catch(() => message.error('公告加载失败'));
   useEffect(() => { load(); }, [q]);
   const edit = (item?: any) => { setEditing(item); form.resetFields(); form.setFieldsValue(item || {}); setOpen(true); };
-  const save = async (values: any) => { setSaving(true); try { await (editing ? api.put(`/announcements/${editing.id}`, values) : api.post('/announcements', values)); message.success('保存成功'); setOpen(false); load(); } catch (error: any) { message.error(error.response?.data?.msg || '保存公告失败'); } finally { setSaving(false); } };
-  const changeStatus = async (item: any, action: 'publish' | 'offline') => { try { await api.patch(`/announcements/${item.id}/${action}`); message.success(action === 'publish' ? '发布成功' : '下线成功'); load(); } catch (error: any) { message.error(error.response?.data?.msg || '操作失败'); } };
+  const save = async (values: any) => { setSaving(true); try { await (editing ? api.put(`/announcements/${editing.id}`, values) : api.post('/announcements', values)); track(editing ? 'announcement_update_success' : 'announcement_create_success', 'business', { announcement_id: editing?.id }); message.success('保存成功'); setOpen(false); load(); } catch (error: any) { message.error(error.response?.data?.msg || '保存公告失败'); } finally { setSaving(false); } };
+  const changeStatus = async (item: any, action: 'publish' | 'offline') => { try { await api.patch(`/announcements/${item.id}/${action}`); track(action === 'publish' ? 'announcement_publish' : 'announcement_offline', 'business', { announcement_id: item.id }); message.success(action === 'publish' ? '发布成功' : '下线成功'); load(); } catch (error: any) { message.error(error.response?.data?.msg || '操作失败'); } };
   const statusNames: Record<string, string> = { draft: '草稿', published: '已发布', offline: '已下线' };
   return <div className="page"><div className="page-title compact"><div><h1>公告管理</h1></div><Button type="primary" icon={<PlusOutlined />} onClick={() => edit()}>新增公告</Button></div><Card className="table-card"><div className="filters"><Input allowClear prefix={<SearchOutlined />} placeholder="搜索公告标题" onChange={e => setQ({ ...q, page: 1, keyword: e.target.value })} /><Select allowClear placeholder="公告状态" onChange={v => setQ({ ...q, page: 1, status: v || '' })} options={Object.entries(statusNames).map(([value, label]) => ({ value, label }))} /></div><Table rowKey="id" dataSource={data.rows} pagination={{ current: q.page, pageSize: q.pageSize, total: data.total, showSizeChanger: false, onChange: page => setQ({ ...q, page }) }} columns={[{ title: '标题', dataIndex: 'title', width: 260 }, { title: '发布时间', dataIndex: 'published_at', width: 180, render: (v: string) => v || '-' }, { title: '状态', dataIndex: 'status', width: 120, render: (v: string) => <Tag color={v === 'published' ? 'green' : v === 'draft' ? 'gold' : 'default'}>{statusNames[v] || v}</Tag> }, { title: '发布人', dataIndex: 'publisher_name', width: 120, render: (v: string) => v || '-' }, { title: '内容预览', dataIndex: 'content', ellipsis: true, render: (v: string) => <span dangerouslySetInnerHTML={{ __html: v }} /> }, { title: '操作', width: 230, render: (_: any, item: any) => <Space>{item.status === 'draft' && <><Button type="link" onClick={() => edit(item)}>编辑</Button><Popconfirm title="确认发布该公告？" onConfirm={() => changeStatus(item, 'publish')}><Button type="link">发布</Button></Popconfirm></>}{item.status === 'published' && <Popconfirm title="确认下线该公告？" onConfirm={() => changeStatus(item, 'offline')}><Button type="link" danger>下线</Button></Popconfirm>}</Space> }]} /></Card><Modal title={editing ? '编辑公告' : '新增公告'} open={open} onCancel={() => setOpen(false)} onOk={() => form.submit()} okButtonProps={{ loading: saving }} okText="保存" cancelText="取消"><Form form={form} layout="vertical" onFinish={save}><Form.Item name="title" label="标题" rules={[{ required: true, message: '请输入公告标题' }]}><Input maxLength={100} /></Form.Item><Form.Item name="content" label="内容" rules={[{ required: true, message: '请输入公告内容' }]}><Form.Item noStyle shouldUpdate>{({ getFieldValue, setFieldsValue }) => <AnnouncementEditor value={getFieldValue('content') || ''} onChange={value => setFieldsValue({ content: value })} />}</Form.Item></Form.Item></Form></Modal></div>;
 }
 
+function TrackPageViews() {
+  const location = useLocation();
+  const last = React.useRef("");
+  useEffect(() => {
+    if (last.current === location.pathname) return;
+    last.current = location.pathname;
+    track("page_view", "page", { title: location.pathname });
+  }, [location.pathname]);
+  return null;
+}
+
 function App() {
   return (
-    <Routes>
+    <>
+      <TrackPageViews />
+      <Routes>
       <Route path="/login" element={<Login />} />
       <Route
         path="/"
@@ -1546,7 +1704,8 @@ function App() {
       />
       <Route path="/announcements" element={<Protected><AnnouncementsPage /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+    </>
   );
 }
 createRoot(document.getElementById("root")!).render(

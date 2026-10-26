@@ -1,0 +1,9 @@
+.git
+**/node_modules
+client/dist
+server/data
+docs
+*.md
+.gitignore
+render.yaml
+.dockerignore
